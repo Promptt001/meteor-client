@@ -14,6 +14,7 @@ import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.systems.modules.render.Xray;
 import meteordevelopment.meteorclient.systems.modules.world.InfinityMiner;
+import meteordevelopment.meteorclient.systems.modules.world.PacketMine;
 import meteordevelopment.meteorclient.utils.Utils;
 import meteordevelopment.meteorclient.utils.misc.ListMode;
 import meteordevelopment.meteorclient.utils.player.InvUtils;
@@ -148,6 +149,10 @@ public class AutoTool extends Module {
     @EventHandler(priority = EventPriority.HIGH)
     private void onStartBreakingBlock(StartBreakingBlockEvent event) {
         if (Modules.get().isActive(InfinityMiner.class)) return;
+
+        // PacketMine owns breaking and tool selection while it is active; clicks are queue operations.
+        if (Modules.get().isActive(PacketMine.class)) return;
+
         if (mc.player.isCreative()) return;
 
         // Get blockState
@@ -157,23 +162,10 @@ public class AutoTool extends Module {
         // Check if we should switch to a better tool
         ItemStack currentStack = mc.player.getMainHandItem();
 
-        double bestScore = -1;
-        bestSlot = -1;
-
-        for (int i = 0; i < 9; i++) {
-            ItemStack itemStack = mc.player.getInventory().getItem(i);
-
-            boolean itemInList = (listMode.get() == ListMode.Whitelist ? whitelist.get() : blacklist.get()).contains(itemStack.getItem());
-            if (!listMode.get().allows(itemInList)) continue;
-
-            double score = getScore(itemStack, blockState, silkTouchForEnderChest.get(), fortuneForOresCrops.get(), prefer.get(), itemStack2 -> !shouldStopUsing(itemStack2));
-            if (score < 0) continue;
-
-            if (score > bestScore) {
-                bestScore = score;
-                bestSlot = i;
-            }
-        }
+        bestSlot = getBestSlot(blockState);
+        double bestScore = bestSlot != -1
+            ? getScore(mc.player.getInventory().getItem(bestSlot), blockState, silkTouchForEnderChest.get(), fortuneForOresCrops.get(), prefer.get(), itemStack -> !shouldStopUsing(itemStack))
+            : -1;
 
         if ((bestSlot != -1 && (bestScore > getScore(currentStack, blockState, silkTouchForEnderChest.get(), fortuneForOresCrops.get(), prefer.get(), itemStack -> !shouldStopUsing(itemStack))) || shouldStopUsing(currentStack) || !isTool(currentStack))) {
             ticks = switchDelay.get();
@@ -189,6 +181,32 @@ public class AutoTool extends Module {
             mc.options.keyAttack.setDown(false);
             event.cancel();
         }
+    }
+
+    /**
+     * Returns the hotbar slot holding the best tool for the given block state, or -1 if there is none.
+     * Honors the whitelist/blacklist, enchantment preferences and the anti-break setting.
+     */
+    public int getBestSlot(BlockState state) {
+        double bestScore = -1;
+        int bestSlot = -1;
+
+        for (int i = 0; i < 9; i++) {
+            ItemStack itemStack = mc.player.getInventory().getItem(i);
+
+            boolean itemInList = (listMode.get() == ListMode.Whitelist ? whitelist.get() : blacklist.get()).contains(itemStack.getItem());
+            if (!listMode.get().allows(itemInList)) continue;
+
+            double score = getScore(itemStack, state, silkTouchForEnderChest.get(), fortuneForOresCrops.get(), prefer.get(), itemStack2 -> !shouldStopUsing(itemStack2));
+            if (score < 0) continue;
+
+            if (score > bestScore) {
+                bestScore = score;
+                bestSlot = i;
+            }
+        }
+
+        return bestSlot;
     }
 
     private boolean shouldStopUsing(ItemStack itemStack) {
