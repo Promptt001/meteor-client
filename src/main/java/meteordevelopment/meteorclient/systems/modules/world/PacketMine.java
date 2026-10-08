@@ -13,6 +13,7 @@ import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Categories;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.systems.modules.Modules;
+import meteordevelopment.meteorclient.systems.modules.player.AutoTool;
 import meteordevelopment.meteorclient.systems.modules.render.BreakIndicators;
 import meteordevelopment.meteorclient.utils.Utils;
 import meteordevelopment.meteorclient.utils.misc.Pool;
@@ -56,7 +57,7 @@ public class PacketMine extends Module {
 
     private final Setting<Boolean> autoSwitch = sgGeneral.add(new BoolSetting.Builder()
         .name("auto-switch")
-        .description("Automatically switches to the best tool when the block is ready to be mined instantly.")
+        .description("Holds the best tool for the block currently being mined (server-side only; your hotbar selection is untouched).")
         .defaultValue(false)
         .build()
     );
@@ -123,7 +124,9 @@ public class PacketMine extends Module {
     private final Pool<MyBlock> blockPool = new Pool<>(MyBlock::new);
     public final List<MyBlock> blocks = new ArrayList<>();
 
-    private boolean swapped, shouldUpdateSlot;
+    private int serverSlot = -1;
+    private boolean shouldUpdateSlot;
+    private BlockPos headBlockPos;
 
     public PacketMine() {
         super(Categories.World, "packet-mine", "Sends packets to mine blocks without the mining animation.");
@@ -131,7 +134,9 @@ public class PacketMine extends Module {
 
     @Override
     public void onActivate() {
-        swapped = false;
+        serverSlot = -1;
+        shouldUpdateSlot = false;
+        headBlockPos = null;
     }
 
     @Override
@@ -139,18 +144,20 @@ public class PacketMine extends Module {
         blockPool.freeAll(blocks);
         blocks.clear();
 
-        if (shouldUpdateSlot) {
+        // Restore the server's held slot to the client's selection if we are still holding a tool for a head.
+        if (mc.player != null && serverSlot != -1) {
             mc.player.connection.send(new ServerboundSetCarriedItemPacket(mc.player.getInventory().getSelectedSlot()));
-            shouldUpdateSlot = false;
         }
+
+        serverSlot = -1;
+        shouldUpdateSlot = false;
+        headBlockPos = null;
     }
 
     @EventHandler
     private void onStartBreakingBlock(StartBreakingBlockEvent event) {
         if (!BlockUtils.canBreak(event.blockPos)) return;
         event.cancel();
-
-        swapped = false;
 
         if (!isMiningBlock(event.blockPos)) {
             blocks.add(blockPool.get().set(event));
@@ -169,24 +176,38 @@ public class PacketMine extends Module {
     private void onTick(TickEvent.Pre event) {
         blocks.removeIf(MyBlock::shouldRemove);
 
+        // Restore the client's selection server-side when the queue head changes or the queue empties.
+        BlockPos newHead = blocks.isEmpty() ? null : blocks.getFirst().blockPos;
+        if ((newHead == null || !newHead.equals(headBlockPos)) && serverSlot != -1) {
+            mc.player.connection.send(new ServerboundSetCarriedItemPacket(mc.player.getInventory().getSelectedSlot()));
+            serverSlot = -1;
+            shouldUpdateSlot = false;
+        }
+
+        headBlockPos = newHead;
+
         if (shouldUpdateSlot) {
             mc.player.connection.send(new ServerboundSetCarriedItemPacket(mc.player.getInventory().getSelectedSlot()));
             shouldUpdateSlot = false;
-            swapped = false;
         }
 
         if (!blocks.isEmpty()) {
             MyBlock block = blocks.getFirst();
             block.mine();
-
-            if (block.isReady() && !swapped && autoSwitch.get() && (!mc.player.isUsingItem() || !notOnUse.get())) {
-                FindItemResult slot = InvUtils.findFastestTool(block.blockState);
-                if (!slot.found() || mc.player.getInventory().getSelectedSlot() == slot.slot()) return;
-                mc.player.connection.send(new ServerboundSetCarriedItemPacket(slot.slot()));
-                swapped = true;
-                shouldUpdateSlot = true;
-            }
         }
+    }
+
+    /**
+     * Returns the best hotbar slot for the given block state, or -1 if none is acceptable.
+     * Uses AutoTool's scoring while it is active (honoring its whitelist/blacklist),
+     * otherwise falls back to the fastest tool in the inventory.
+     */
+    private int getBestSlotFor(BlockState state) {
+        AutoTool autoTool = Modules.get().get(AutoTool.class);
+        if (autoTool.isActive()) return autoTool.getBestSlot(state);
+
+        FindItemResult slot = InvUtils.findFastestTool(state);
+        return slot.found() ? slot.slot() : -1;
     }
 
     @EventHandler
@@ -236,8 +257,12 @@ public class PacketMine extends Module {
         public double progress() {
             if (!mining) return 0;
 
-            FindItemResult fir = InvUtils.findFastestTool(blockState);
-            return BlockUtils.getBreakDelta(fir.found() ? fir.slot() : mc.player.getInventory().getSelectedSlot(), blockState) * ((mc.player.tickCount - startTime) + 1);
+            // Predict with the slot actually held on the server: the queue head's held tool, else the client's selection.
+            int slot = serverSlot != -1 && !blocks.isEmpty() && blocks.getFirst() == this
+                ? serverSlot
+                : mc.player.getInventory().getSelectedSlot();
+
+            return BlockUtils.getBreakDelta(slot, blockState) * ((mc.player.tickCount - startTime) + 1);
         }
 
         public void mine() {
@@ -249,6 +274,16 @@ public class PacketMine extends Module {
         private void sendMinePackets() {
             if (timer <= 0) {
                 if (!mining) {
+                    // Hold the best tool for this block server-side BEFORE the first START so the first tick accumulates at its speed.
+                    if (autoSwitch.get() && (!mc.player.isUsingItem() || !notOnUse.get())) {
+                        int best = getBestSlotFor(blockState);
+
+                        if (best != serverSlot) {
+                            mc.player.connection.send(new ServerboundSetCarriedItemPacket(best != -1 ? best : mc.player.getInventory().getSelectedSlot()));
+                            serverSlot = best;
+                        }
+                    }
+
                     mc.gameMode.startPrediction(mc.level, sequence -> new ServerboundPlayerActionPacket(ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK, blockPos, direction, sequence));
                     mc.gameMode.startPrediction(mc.level, sequence -> new ServerboundPlayerActionPacket(ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK, blockPos, direction, sequence));
 
