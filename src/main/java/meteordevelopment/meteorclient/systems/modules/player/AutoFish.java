@@ -114,6 +114,7 @@ public class AutoFish extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
+        if (mc.player == null || mc.world == null) return;
         if (mc.player.fishing != null) handleFishing();
         else handleIdle();
     }
